@@ -290,7 +290,7 @@ async def require_auth(request: Request, authorization: Optional[str] = Header(N
         raise HTTPException(status_code=401, detail="Unauthorized")
     return user
 
-async def require_role(roles: List[str]):
+def require_role(roles: List[str]):
     async def role_checker(user: User = Depends(require_auth)):
         if user.role not in roles:
             raise HTTPException(status_code=403, detail="Forbidden")
