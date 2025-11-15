@@ -957,6 +957,230 @@ async def generate_quiz_from_content(req: AIQuizGenerateRequest, user: User = De
         logging.error(f"Quiz generation error: {e}")
         return {"generated_quiz": "Error generating quiz. Please try again."}
 
+# ==================== VIDEO PROGRESS ROUTES ====================
+
+@api_router.post("/video-progress")
+async def update_video_progress(req: VideoProgressUpdate, user: User = Depends(require_auth)):
+    # Check if progress exists
+    existing = await db.video_progress.find_one({
+        "user_id": user.id,
+        "lesson_id": req.lesson_id
+    })
+    
+    completed = req.progress_seconds >= req.total_seconds * 0.9  # 90% completion
+    
+    if existing:
+        await db.video_progress.update_one(
+            {"user_id": user.id, "lesson_id": req.lesson_id},
+            {"$set": {
+                "progress_seconds": req.progress_seconds,
+                "total_seconds": req.total_seconds,
+                "completed": completed,
+                "last_watched": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+    else:
+        progress = VideoProgress(
+            user_id=user.id,
+            lesson_id=req.lesson_id,
+            progress_seconds=req.progress_seconds,
+            total_seconds=req.total_seconds,
+            completed=completed
+        )
+        progress_doc = progress.model_dump()
+        progress_doc["last_watched"] = progress_doc["last_watched"].isoformat()
+        await db.video_progress.insert_one(progress_doc)
+    
+    return {"message": "Progress updated", "completed": completed}
+
+@api_router.get("/video-progress/{lesson_id}")
+async def get_video_progress(lesson_id: str, user: User = Depends(require_auth)):
+    progress = await db.video_progress.find_one({
+        "user_id": user.id,
+        "lesson_id": lesson_id
+    }, {"_id": 0})
+    
+    if not progress:
+        return {"progress_seconds": 0, "completed": False}
+    
+    return progress
+
+# ==================== ASSIGNMENT ROUTES ====================
+
+@api_router.get("/assignments", response_model=List[Assignment])
+async def get_assignments(course_id: Optional[str] = None, user: User = Depends(require_auth)):
+    query = {}
+    if course_id:
+        query["course_id"] = course_id
+    
+    assignments = await db.assignments.find(query, {"_id": 0}).to_list(1000)
+    return assignments
+
+@api_router.post("/assignments", response_model=Assignment)
+async def create_assignment(
+    course_id: str,
+    title: str,
+    description: str,
+    instructions: str,
+    max_score: float = 100.0,
+    due_date: Optional[str] = None,
+    lesson_id: Optional[str] = None,
+    user: User = Depends(require_role(["instructor", "admin"]))
+):
+    assignment = Assignment(
+        course_id=course_id,
+        lesson_id=lesson_id,
+        title=title,
+        description=description,
+        instructions=instructions,
+        max_score=max_score,
+        due_date=datetime.fromisoformat(due_date) if due_date else None
+    )
+    
+    assignment_doc = assignment.model_dump()
+    assignment_doc["created_at"] = assignment_doc["created_at"].isoformat()
+    if assignment_doc.get("due_date"):
+        assignment_doc["due_date"] = assignment_doc["due_date"].isoformat()
+    await db.assignments.insert_one(assignment_doc)
+    
+    return assignment
+
+@api_router.post("/assignments/submit")
+async def submit_assignment(req: AssignmentSubmitRequest, user: User = Depends(require_auth)):
+    # Check if already submitted
+    existing = await db.assignment_submissions.find_one({
+        "assignment_id": req.assignment_id,
+        "user_id": user.id
+    })
+    
+    if existing:
+        raise HTTPException(status_code=400, detail="Assignment already submitted")
+    
+    # Get assignment details
+    assignment = await db.assignments.find_one({"id": req.assignment_id})
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    
+    # AI-powered feedback
+    ai_feedback = ""
+    try:
+        llm = LlmChat(
+            api_key=os.environ["EMERGENT_LLM_KEY"],
+            session_id=f"assignment_{user.id}",
+            system_message="You are an educational assignment evaluator. Provide constructive feedback on student submissions."
+        ).with_model("openai", "gpt-4o-mini")
+        
+        message = UserMessage(
+            text=f"Assignment: {assignment['title']}\n\nInstructions: {assignment['instructions']}\n\nStudent Submission:\n{req.content}\n\nProvide brief feedback (3-4 points) on strengths and areas for improvement."
+        )
+        
+        ai_feedback = await llm.send_message(message)
+    except Exception as e:
+        logging.error(f"AI feedback error: {e}")
+        ai_feedback = "Unable to generate AI feedback at this time."
+    
+    submission = AssignmentSubmission(
+        assignment_id=req.assignment_id,
+        user_id=user.id,
+        content=req.content,
+        file_urls=req.file_urls,
+        ai_feedback=ai_feedback
+    )
+    
+    submission_doc = submission.model_dump()
+    submission_doc["submitted_at"] = submission_doc["submitted_at"].isoformat()
+    await db.assignment_submissions.insert_one(submission_doc)
+    
+    return {
+        "message": "Assignment submitted successfully",
+        "submission_id": submission.id,
+        "ai_feedback": ai_feedback
+    }
+
+@api_router.get("/assignments/{assignment_id}/submissions")
+async def get_assignment_submissions(assignment_id: str, user: User = Depends(require_auth)):
+    if user.role == "student":
+        # Students can only see their own submission
+        submission = await db.assignment_submissions.find_one({
+            "assignment_id": assignment_id,
+            "user_id": user.id
+        }, {"_id": 0})
+        return [submission] if submission else []
+    else:
+        # Teachers/admins can see all submissions
+        submissions = await db.assignment_submissions.find({
+            "assignment_id": assignment_id
+        }, {"_id": 0}).to_list(1000)
+        
+        # Enrich with student names
+        for sub in submissions:
+            student = await db.users.find_one({"id": sub["user_id"]}, {"_id": 0, "name": 1, "email": 1})
+            sub["student_name"] = student["name"] if student else "Unknown"
+            sub["student_email"] = student["email"] if student else "Unknown"
+        
+        return submissions
+
+@api_router.put("/assignments/submissions/{submission_id}/grade")
+async def grade_assignment(
+    submission_id: str,
+    score: float,
+    feedback: str,
+    user: User = Depends(require_role(["instructor", "admin"]))
+):
+    submission = await db.assignment_submissions.find_one({"id": submission_id})
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    
+    await db.assignment_submissions.update_one(
+        {"id": submission_id},
+        {"$set": {
+            "score": score,
+            "feedback": feedback,
+            "status": "graded"
+        }}
+    )
+    
+    return {"message": "Assignment graded successfully"}
+
+# ==================== LESSON COMPLETION TRACKING ====================
+
+@api_router.post("/lessons/{lesson_id}/complete")
+async def mark_lesson_complete(lesson_id: str, user: User = Depends(require_auth)):
+    # Get lesson to find course_id
+    lesson = await db.lessons.find_one({"id": lesson_id})
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    
+    # Update enrollment progress
+    enrollment = await db.enrollments.find_one({
+        "user_id": user.id,
+        "course_id": lesson["course_id"]
+    })
+    
+    if enrollment:
+        # Get total lessons in course
+        total_lessons = await db.lessons.count_documents({"course_id": lesson["course_id"]})
+        
+        # Get completed lessons (via video progress)
+        completed_count = await db.video_progress.count_documents({
+            "user_id": user.id,
+            "completed": True
+        })
+        
+        progress = (completed_count / total_lessons * 100) if total_lessons > 0 else 0
+        
+        await db.enrollments.update_one(
+            {"id": enrollment["id"]},
+            {"$set": {
+                "progress": progress,
+                "last_watched_lesson_id": lesson_id
+            }}
+        )
+        
+        return {"message": "Lesson marked complete", "progress": progress}
+    
+    return {"message": "Enrollment not found"}
+
 # ==================== MOCK PAYMENT ROUTES ====================
 
 @api_router.post("/payments/mock")
