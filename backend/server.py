@@ -239,6 +239,51 @@ class BlogPostCreate(BaseModel):
     content: str
     tags: List[str] = []
 
+class VideoProgress(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    lesson_id: str
+    progress_seconds: float
+    total_seconds: float
+    completed: bool = False
+    last_watched: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class AssignmentSubmission(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    assignment_id: str
+    user_id: str
+    content: str
+    file_urls: List[str] = []
+    submitted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    status: str = "submitted"  # submitted, graded, returned
+    score: Optional[float] = None
+    feedback: Optional[str] = None
+    ai_feedback: Optional[str] = None
+
+class Assignment(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    course_id: str
+    lesson_id: Optional[str] = None
+    title: str
+    description: str
+    instructions: str
+    max_score: float = 100.0
+    due_date: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class AssignmentSubmitRequest(BaseModel):
+    assignment_id: str
+    content: str
+    file_urls: List[str] = []
+
+class VideoProgressUpdate(BaseModel):
+    lesson_id: str
+    progress_seconds: float
+    total_seconds: float
+
 class AIRecommendationRequest(BaseModel):
     user_interests: List[str] = []
     completed_courses: List[str] = []
